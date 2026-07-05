@@ -1,0 +1,40 @@
+{
+  "policy_query_sft": {
+    "file_name": "train/sft_train.jsonl",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output",
+      "system": "system"
+    }
+  },
+  "policy_query_dpo": {
+    "file_name": "train/dpo_train.jsonl",
+    "ranking": true,
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "chosen": "chosen",
+      "rejected": "rejected",
+      "system": "system"
+    }
+  },
+  "policy_query_grpo_reference": {
+    "file_name": "train/grpo_train.jsonl",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output",
+      "system": "system"
+    }
+  },
+  "policy_query_grpo_domain_augmented": {
+    "file_name": "train/grpo_train_domain_augmented.jsonl",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output",
+      "system": "system"
+    }
+  }
+}

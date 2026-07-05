@@ -1,0 +1,178 @@
+{
+  "cleaning": {
+    "conditionalqa": {
+      "raw_document_count": 652,
+      "policy_chunk_count": 12552,
+      "referenced_document_count": 631,
+      "unreferenced_document_count": 21,
+      "unreferenced_urls": [
+        "https://www.gov.uk/access-to-work",
+        "https://www.gov.uk/appeal-benefit-decision",
+        "https://www.gov.uk/become-an-mot-tester",
+        "https://www.gov.uk/benefit-cap",
+        "https://www.gov.uk/benefit-overpayments",
+        "https://www.gov.uk/benefits-and-prison",
+        "https://www.gov.uk/child-tax-credit",
+        "https://www.gov.uk/christmas-bonus",
+        "https://www.gov.uk/claim-benefits-abroad",
+        "https://www.gov.uk/cold-weather-payment",
+        "https://www.gov.uk/disability-premiums",
+        "https://www.gov.uk/get-help-savings-low-income",
+        "https://www.gov.uk/jobseekers-allowance",
+        "https://www.gov.uk/manage-child-maintenance-case",
+        "https://www.gov.uk/moving-from-benefits-to-work",
+        "https://www.gov.uk/pension-credit",
+        "https://www.gov.uk/tax-credits-appeals-complaints",
+        "https://www.gov.uk/tax-credits-overpayments",
+        "https://www.gov.uk/universal-credit",
+        "https://www.gov.uk/winter-fuel-payment",
+        "https://www.gov.uk/working-tax-credit"
+      ],
+      "evidence_total": 10284,
+      "evidence_mapped": 10283,
+      "evidence_mapping_rate": 0.999902761571373
+    },
+    "qrecc": {
+      "train": {
+        "raw_count": 63501,
+        "clean_count": 63501,
+        "duplicate_count": 0,
+        "nontrivial_rewrite_count": 56685,
+        "source_counts": {
+          "quac": 50360,
+          "nq": 13141
+        }
+      },
+      "test": {
+        "raw_count": 16451,
+        "clean_count": 16451,
+        "duplicate_count": 0,
+        "nontrivial_rewrite_count": 14610,
+        "source_counts": {
+          "trec": 748,
+          "quac": 12389,
+          "nq": 3314
+        }
+      }
+    },
+    "musique": {
+      "train": {
+        "count": 19938,
+        "hop_counts": {
+          "2": 14376,
+          "3": 4387,
+          "4": 1175
+        }
+      },
+      "dev": {
+        "count": 2417,
+        "hop_counts": {
+          "2": 1252,
+          "3": 760,
+          "4": 405
+        }
+      },
+      "test": {
+        "count": 2459,
+        "hop_counts": {
+          "0": 2459
+        }
+      },
+      "knowledge_record_count": 117528
+    }
+  },
+  "policy_chunk_lengths": {
+    "count": 12552,
+    "mean": 394.9282982791587,
+    "median": 346.0,
+    "p95": 829.0,
+    "min": 35.0,
+    "max": 1672.0
+  },
+  "qrecc": {
+    "count": 63501,
+    "nontrivial_count": 56685,
+    "source_counts": {
+      "quac": 50360,
+      "nq": 13141
+    },
+    "history_turn_counts": {
+      "0": 11020,
+      "1": 10185,
+      "2": 10182,
+      "3": 9865,
+      "4": 8598,
+      "5": 5076,
+      "6": 3810,
+      "7": 2444,
+      "8": 1272,
+      "9": 654,
+      "10": 314,
+      "11": 81
+    },
+    "rewrite_delta": {
+      "count": 63501,
+      "mean": 3.5229208988834824,
+      "median": 2.0,
+      "p95": 11.0,
+      "min": -19.0,
+      "max": 83.0
+    }
+  },
+  "conditionalqa": {
+    "count": 2338,
+    "multi_evidence_count": 1811,
+    "unanswerable_count": 91,
+    "evidence_count_distribution": {
+      "4": 297,
+      "1": 435,
+      "3": 353,
+      "2": 403,
+      "15": 14,
+      "5": 237,
+      "7": 122,
+      "6": 144,
+      "8": 79,
+      "0": 92,
+      "10": 25,
+      "9": 54,
+      "12": 12,
+      "21": 5,
+      "14": 12,
+      "13": 8,
+      "11": 29,
+      "18": 2,
+      "29": 1,
+      "16": 5,
+      "25": 1,
+      "17": 6,
+      "19": 2
+    }
+  },
+  "final_training_mix": {
+    "sft_count": 20000,
+    "sft_mix": {
+      "qrecc_nontrivial": 14130,
+      "policy_domain": 2338,
+      "qrecc_no_op": 3532
+    },
+    "dpo_count": 5000,
+    "dpo_mix": {
+      "qrecc": 4000,
+      "conditionalqa": 1000
+    },
+    "dpo_error_mix": {
+      "entity_omission": 1000,
+      "unresolved_reference": 1000,
+      "constraint_omission": 1000,
+      "overly_broad": 1000,
+      "wrong_context": 1000
+    },
+    "grpo_count": 5000,
+    "grpo_hop_mix": {
+      "2": 3134,
+      "4": 628,
+      "3": 1238
+    }
+  }
+}

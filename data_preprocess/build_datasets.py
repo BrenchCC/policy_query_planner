@@ -1,0 +1,678 @@
+import os
+import re
+import sys
+import json
+import math
+import random
+import logging
+import argparse
+from collections import Counter, defaultdict
+from typing import Any, Callable, Hashable
+
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+# Add project root to Python path
+sys.path.append(os.getcwd())
+
+from data_preprocess.common import (
+    read_jsonl,
+    write_json,
+    write_jsonl,
+    normalize_text,
+    normalized_key
+)
+from data_preprocess.config import (
+    INTERIM_ROOT,
+    PROCESSED_ROOT,
+    RANDOM_SEED,
+    TARGET_COUNTS,
+    PLANNER_SYSTEM_PROMPT
+)
+from data_preprocess.schemas import (
+    serialize_plan,
+    validate_sft_record,
+    validate_dpo_record,
+    validate_grpo_record
+)
+
+logger = logging.getLogger(__name__)
+
+SFT_INSTRUCTION = (
+    "Rewrite the current question as a standalone retrieval query. Return a JSON query plan only "
+    "and do not answer the question."
+)
+DPO_INSTRUCTION = SFT_INSTRUCTION
+GRPO_INSTRUCTION = (
+    "Decompose the multi-hop question into ordered retrieval queries. Return a JSON query plan only "
+    "and do not answer the question."
+)
+ERROR_TYPES = [
+    "unresolved_reference",
+    "entity_omission",
+    "constraint_omission",
+    "overly_broad",
+    "wrong_context"
+]
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments.
+
+    Returns:
+        Parsed command-line arguments.
+    """
+    parser = argparse.ArgumentParser(description = "Build final training and evaluation datasets")
+    parser.add_argument("--force", action = "store_true", help = "Replace existing outputs")
+    return parser.parse_args()
+
+
+def stratified_sample(
+    records: list[dict[str, Any]],
+    target_count: int,
+    key_function: Callable[[dict[str, Any]], Hashable],
+    seed: int
+) -> list[dict[str, Any]]:
+    """Sample records while preserving a categorical distribution.
+
+    Args:
+        records: Candidate records.
+        target_count: Exact number of requested records.
+        key_function: Function mapping a record to a stratum.
+        seed: Deterministic random seed.
+
+    Returns:
+        Deterministically sampled records.
+
+    Raises:
+        ValueError: If the candidate pool is too small.
+    """
+    if target_count > len(records):
+        raise ValueError(f"Cannot sample {target_count} records from {len(records)} candidates")
+    random_generator = random.Random(seed)
+    groups: dict[Hashable, list[dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        groups[key_function(record)].append(record)
+    for group in groups.values():
+        random_generator.shuffle(group)
+
+    total = len(records)
+    allocations = {}
+    fractions = []
+    for key, group in groups.items():
+        exact = target_count * len(group) / total
+        base = min(len(group), math.floor(exact))
+        allocations[key] = base
+        fractions.append((exact - base, str(key), key))
+    remaining = target_count - sum(allocations.values())
+    fractions.sort(reverse = True)
+    while remaining:
+        progress = False
+        for _, _, key in fractions:
+            if allocations[key] < len(groups[key]):
+                allocations[key] += 1
+                remaining -= 1
+                progress = True
+                if remaining == 0:
+                    break
+        if not progress:
+            raise ValueError("Unable to complete stratified allocation")
+
+    sampled = []
+    for key in sorted(groups, key = str):
+        sampled.extend(groups[key][:allocations[key]])
+    random_generator.shuffle(sampled)
+    return sampled
+
+
+def format_qrecc_input(record: dict[str, Any]) -> str:
+    """Format a QReCC record as an Alpaca input.
+
+    Args:
+        record: Clean QReCC record.
+
+    Returns:
+        Conversation history and current question.
+    """
+    if record["history_text"]:
+        return (
+            f"Conversation history:\n{record['history_text']}\n\n"
+            f"Current question:\n{record['question']}"
+        )
+    return f"Current question:\n{record['question']}"
+
+
+def qrecc_content_key(record: dict[str, Any]) -> tuple[str, str, str]:
+    """Build a split-independent QReCC leakage fingerprint.
+
+    Args:
+        record: Clean QReCC record.
+
+    Returns:
+        Normalized question, rewrite, and answer tuple.
+    """
+    return (
+        normalized_key(record["question"]),
+        normalized_key(record["rewrite"]),
+        normalized_key(record["answer"])
+    )
+
+
+def single_query_plan(query: str) -> str:
+    """Create a serialized one-query planner response.
+
+    Args:
+        query: Standalone retrieval query.
+
+    Returns:
+        Serialized planner response.
+    """
+    return serialize_plan(
+        [
+            {
+                "id": "q1",
+                "query": normalize_text(query),
+                "depends_on": []
+            }
+        ]
+    )
+
+
+def fit_policy_keyword_model(
+    records: list[dict[str, Any]]
+) -> tuple[TfidfVectorizer, Any]:
+    """Fit a deterministic keyword extractor over policy inputs.
+
+    Args:
+        records: ConditionalQA training records.
+
+    Returns:
+        Fitted vectorizer and sparse scenario matrix.
+    """
+    scenario_texts = [record["scenario"] for record in records]
+    vectorizer = TfidfVectorizer(
+        stop_words = "english",
+        ngram_range = (1, 2),
+        max_features = 12000,
+        min_df = 2
+    )
+    matrix = vectorizer.fit_transform(scenario_texts)
+    return vectorizer, matrix
+
+
+def build_policy_query(
+    record: dict[str, Any],
+    vectorizer: TfidfVectorizer,
+    row: Any
+) -> str:
+    """Construct an answer-free policy retrieval query.
+
+    Args:
+        record: ConditionalQA training record.
+        vectorizer: Fitted policy TF-IDF vectorizer.
+        row: Sparse TF-IDF row for the record scenario.
+
+    Returns:
+        Compact retrieval query containing prompt-visible constraints.
+    """
+    feature_names = vectorizer.get_feature_names_out()
+    if row.nnz:
+        ranked_positions = np.argsort(row.data)[::-1][:6]
+        keywords = [feature_names[row.indices[position]] for position in ranked_positions]
+    else:
+        keywords = []
+    query_parts = [record["title"], record["question"]] + keywords
+    words = normalize_text(" ".join(query_parts)).split()
+    return " ".join(words[:45])
+
+
+def build_sft_records(
+    qrecc_train: list[dict[str, Any]],
+    conditional_train: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Build the exact 20K SFT mixture.
+
+    Args:
+        qrecc_train: Clean QReCC training records.
+        conditional_train: Clean ConditionalQA training records.
+
+    Returns:
+        SFT records and policy record ID to chosen plan mapping.
+    """
+    nontrivial = [record for record in qrecc_train if record["nontrivial_rewrite"]]
+    no_op = [record for record in qrecc_train if not record["nontrivial_rewrite"]]
+    selected_nontrivial = stratified_sample(
+        nontrivial,
+        14130,
+        lambda record: (record["conversation_source"], record["context_turns"]),
+        RANDOM_SEED
+    )
+    selected_no_op = stratified_sample(
+        no_op,
+        3532,
+        lambda record: (record["conversation_source"], record["context_turns"]),
+        RANDOM_SEED + 1
+    )
+    sft_records = []
+    for source_type, selected_records in [
+        ("qrecc_nontrivial", selected_nontrivial),
+        ("qrecc_no_op", selected_no_op)
+    ]:
+        for record in selected_records:
+            sft_record = {
+                "id": "sft_" + record["id"],
+                "instruction": SFT_INSTRUCTION,
+                "input": format_qrecc_input(record),
+                "output": single_query_plan(record["rewrite"]),
+                "system": PLANNER_SYSTEM_PROMPT,
+                "source_dataset": "qrecc",
+                "source_id": record["id"],
+                "sample_type": source_type
+            }
+            validate_sft_record(sft_record)
+            sft_records.append(sft_record)
+
+    vectorizer, matrix = fit_policy_keyword_model(conditional_train)
+    policy_plans = {}
+    for index, record in enumerate(conditional_train):
+        query = build_policy_query(record, vectorizer, matrix[index])
+        plan = single_query_plan(query)
+        policy_plans[record["id"]] = plan
+        sft_record = {
+            "id": "sft_conditionalqa_" + record["id"],
+            "instruction": SFT_INSTRUCTION,
+            "input": f"Scenario:\n{record['scenario']}\n\nQuestion:\n{record['question']}",
+            "output": plan,
+            "system": PLANNER_SYSTEM_PROMPT,
+            "source_dataset": "conditionalqa",
+            "source_id": record["id"],
+            "sample_type": "policy_domain"
+        }
+        validate_sft_record(sft_record)
+        sft_records.append(sft_record)
+
+    random.Random(RANDOM_SEED).shuffle(sft_records)
+    if len(sft_records) != TARGET_COUNTS["sft"]:
+        raise ValueError(f"Unexpected SFT count: {len(sft_records)}")
+    return sft_records, policy_plans
+
+
+def remove_named_entity(query: str) -> str:
+    """Remove a likely entity from a query.
+
+    Args:
+        query: Correct retrieval query.
+
+    Returns:
+        Query with a central-looking token removed.
+    """
+    words = query.split()
+    candidates = [
+        index
+        for index, word in enumerate(words)
+        if index > 0 and word[:1].isupper() and len(re.sub(r"\W", "", word)) > 2
+    ]
+    if not candidates:
+        candidates = sorted(range(len(words)), key = lambda index: len(words[index]), reverse = True)
+    if candidates and len(words) > 3:
+        words.pop(candidates[0])
+    return " ".join(words)
+
+
+def make_rejected_query(
+    record: dict[str, Any],
+    chosen_query: str,
+    error_type: str,
+    wrong_context_query: str
+) -> str:
+    """Create a deterministic difficult negative query.
+
+    Args:
+        record: Source QReCC or ConditionalQA record.
+        chosen_query: Correct standalone query.
+        error_type: Required negative category.
+        wrong_context_query: Plausible query from an incorrect context.
+
+    Returns:
+        Rejected retrieval query.
+    """
+    words = chosen_query.split()
+    if error_type == "unresolved_reference":
+        rejected = record.get("question", chosen_query)
+    elif error_type == "entity_omission":
+        rejected = remove_named_entity(chosen_query)
+    elif error_type == "constraint_omission":
+        without_numbers = re.sub(r"\b\d+(?:\.\d+)?\b", "", chosen_query)
+        rejected_words = normalize_text(without_numbers).split()
+        if rejected_words == words or len(rejected_words) < 3:
+            keep_count = max(3, math.ceil(len(words) * 0.7))
+            rejected_words = words[:keep_count]
+        rejected = " ".join(rejected_words)
+    elif error_type == "overly_broad":
+        title = record.get("title", "")
+        rejected = f"General information about {title}" if title else "General background information"
+    elif error_type == "wrong_context":
+        rejected = wrong_context_query
+    else:
+        raise ValueError(f"Unsupported DPO error type: {error_type}")
+    rejected = normalize_text(rejected)
+    if len(rejected) < 3 or rejected == normalize_text(chosen_query):
+        rejected = normalize_text("General information " + " ".join(words[:3]))
+    return rejected
+
+
+def build_dpo_records(
+    qrecc_train: list[dict[str, Any]],
+    conditional_train: list[dict[str, Any]],
+    policy_plans: dict[str, str]
+) -> list[dict[str, Any]]:
+    """Build the exact 5K preference mixture.
+
+    Args:
+        qrecc_train: Clean QReCC training records.
+        conditional_train: Clean ConditionalQA training records.
+        policy_plans: Correct ConditionalQA plan mapping.
+
+    Returns:
+        Validated DPO records.
+    """
+    qrecc_candidates = [record for record in qrecc_train if record["nontrivial_rewrite"]]
+    selected_qrecc = stratified_sample(
+        qrecc_candidates,
+        4000,
+        lambda record: (record["conversation_source"], record["context_turns"]),
+        RANDOM_SEED + 2
+    )
+    selected_policy = stratified_sample(
+        conditional_train,
+        1000,
+        lambda record: (record["not_answerable"], min(len(record["evidences"]), 3)),
+        RANDOM_SEED + 3
+    )
+
+    dpo_records = []
+    for index, record in enumerate(selected_qrecc):
+        error_type = ERROR_TYPES[index % len(ERROR_TYPES)]
+        chosen_query = record["rewrite"]
+        prior_question = record["context"][-2] if len(record["context"]) >= 2 else "related topic"
+        rejected_query = make_rejected_query(record, chosen_query, error_type, prior_question)
+        dpo_record = {
+            "id": "dpo_" + record["id"],
+            "instruction": DPO_INSTRUCTION,
+            "input": format_qrecc_input(record),
+            "chosen": single_query_plan(chosen_query),
+            "rejected": single_query_plan(rejected_query),
+            "system": PLANNER_SYSTEM_PROMPT,
+            "source_dataset": "qrecc",
+            "source_id": record["id"],
+            "error_type": error_type
+        }
+        validate_dpo_record(dpo_record)
+        dpo_records.append(dpo_record)
+
+    policy_titles = [record["title"] for record in selected_policy]
+    for index, record in enumerate(selected_policy):
+        error_type = ERROR_TYPES[index % len(ERROR_TYPES)]
+        chosen_plan = policy_plans[record["id"]]
+        chosen_query = json_query(chosen_plan)
+        wrong_title = policy_titles[(index + 1) % len(policy_titles)]
+        rejected_query = make_rejected_query(
+            record,
+            chosen_query,
+            error_type,
+            f"{wrong_title} {record['question']}"
+        )
+        dpo_record = {
+            "id": "dpo_conditionalqa_" + record["id"],
+            "instruction": DPO_INSTRUCTION,
+            "input": f"Scenario:\n{record['scenario']}\n\nQuestion:\n{record['question']}",
+            "chosen": chosen_plan,
+            "rejected": single_query_plan(rejected_query),
+            "system": PLANNER_SYSTEM_PROMPT,
+            "source_dataset": "conditionalqa",
+            "source_id": record["id"],
+            "error_type": error_type
+        }
+        validate_dpo_record(dpo_record)
+        dpo_records.append(dpo_record)
+
+    random.Random(RANDOM_SEED + 4).shuffle(dpo_records)
+    if len(dpo_records) != TARGET_COUNTS["dpo"]:
+        raise ValueError(f"Unexpected DPO count: {len(dpo_records)}")
+    return dpo_records
+
+
+def json_query(plan: str) -> str:
+    """Read the first query string from a serialized plan.
+
+    Args:
+        plan: Serialized one-query planner response.
+
+    Returns:
+        Retrieval query text.
+    """
+    return json.loads(plan)["queries"][0]["query"]
+
+
+def allocate_grpo_records(
+    records: list[dict[str, Any]],
+    target_count: int
+) -> list[dict[str, Any]]:
+    """Sample MuSiQue by hop distribution with a per-hop minimum.
+
+    Args:
+        records: MuSiQue training records.
+        target_count: Exact requested sample count.
+
+    Returns:
+        Stratified multi-hop samples.
+    """
+    groups: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        if record["hop_count"] in {2, 3, 4}:
+            groups[record["hop_count"]].append(record)
+    base_count = 500
+    selected = []
+    remaining_pool = []
+    random_generator = random.Random(RANDOM_SEED + 5)
+    for hop_count in [2, 3, 4]:
+        random_generator.shuffle(groups[hop_count])
+        selected.extend(groups[hop_count][:base_count])
+        remaining_pool.extend(groups[hop_count][base_count:])
+    remaining_target = target_count - len(selected)
+    selected.extend(
+        stratified_sample(
+            remaining_pool,
+            remaining_target,
+            lambda record: record["hop_count"],
+            RANDOM_SEED + 6
+        )
+    )
+    random_generator.shuffle(selected)
+    return selected
+
+
+def convert_musique_plan(record: dict[str, Any]) -> str:
+    """Convert MuSiQue decomposition notation to planner JSON.
+
+    Args:
+        record: Clean MuSiQue record.
+
+    Returns:
+        Serialized dependency-aware query plan.
+    """
+    queries = []
+    for step in record["question_decomposition"]:
+        step_number = int(step["step"])
+        query = step["question"].replace(">>", " ")
+        references = sorted({int(value) for value in re.findall(r"#(\d+)", query)})
+        dependencies = []
+        for reference in references:
+            dependency = f"q{reference}"
+            dependencies.append(dependency)
+            query = query.replace(f"#{reference}", "{{" + dependency + ".answer}}")
+        queries.append(
+            {
+                "id": f"q{step_number}",
+                "query": normalize_text(query),
+                "depends_on": dependencies
+            }
+        )
+    return serialize_plan(queries)
+
+
+def build_grpo_records(musique_train: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build the exact 5K direct MuSiQue GRPO baseline.
+
+    Args:
+        musique_train: Clean MuSiQue training records.
+
+    Returns:
+        Validated GRPO-compatible records.
+    """
+    selected = allocate_grpo_records(musique_train, TARGET_COUNTS["grpo"])
+    grpo_records = []
+    for record in selected:
+        grpo_record = {
+            "id": "grpo_" + record["id"],
+            "instruction": GRPO_INSTRUCTION,
+            "input": f"Question:\n{record['question']}",
+            "output": convert_musique_plan(record),
+            "system": PLANNER_SYSTEM_PROMPT,
+            "source_dataset": "musique",
+            "source_id": record["id"],
+            "namespace": "musique_aux",
+            "hop_count": record["hop_count"],
+            "reference_answer": record["answer"],
+            "answer_aliases": record["answer_aliases"],
+            "hop_answers": [step["answer"] for step in record["question_decomposition"]],
+            "gold_doc_ids": record["gold_doc_ids"]
+        }
+        validate_grpo_record(grpo_record)
+        grpo_records.append(grpo_record)
+    if len(grpo_records) != TARGET_COUNTS["grpo"]:
+        raise ValueError(f"Unexpected GRPO count: {len(grpo_records)}")
+    return grpo_records
+
+
+def export_evaluation_sets() -> dict[str, int]:
+    """Export normalized official benchmark splits without resampling.
+
+    Returns:
+        Output file to record count mapping.
+    """
+    mappings = {
+        "conditionalqa_dev.jsonl": INTERIM_ROOT / "conditionalqa_dev.jsonl",
+        "conditionalqa_test_blind.jsonl": INTERIM_ROOT / "conditionalqa_test_no_answer.jsonl",
+        "qrecc_test.jsonl": INTERIM_ROOT / "qrecc_test.jsonl",
+        "musique_dev.jsonl": INTERIM_ROOT / "musique_dev.jsonl"
+    }
+    counts = {}
+    for file_name, source_path in mappings.items():
+        records = read_jsonl(source_path)
+        write_jsonl(PROCESSED_ROOT / "eval" / file_name, records)
+        counts[file_name] = len(records)
+    return counts
+
+
+def write_dataset_info() -> None:
+    """Write LLaMA-Factory dataset registration metadata."""
+    dataset_info = {
+        "policy_query_sft": {
+            "file_name": "train/sft_train.jsonl",
+            "columns": {
+                "prompt": "instruction",
+                "query": "input",
+                "response": "output",
+                "system": "system"
+            }
+        },
+        "policy_query_dpo": {
+            "file_name": "train/dpo_train.jsonl",
+            "ranking": True,
+            "columns": {
+                "prompt": "instruction",
+                "query": "input",
+                "chosen": "chosen",
+                "rejected": "rejected",
+                "system": "system"
+            }
+        },
+        "policy_query_grpo_reference": {
+            "file_name": "train/grpo_train.jsonl",
+            "columns": {
+                "prompt": "instruction",
+                "query": "input",
+                "response": "output",
+                "system": "system"
+            }
+        },
+        "policy_query_grpo_domain_augmented": {
+            "file_name": "train/grpo_train_domain_augmented.jsonl",
+            "columns": {
+                "prompt": "instruction",
+                "query": "input",
+                "response": "output",
+                "system": "system"
+            }
+        }
+    }
+    write_json(PROCESSED_ROOT / "dataset_info.json", dataset_info)
+
+
+def main() -> None:
+    """Build final train and benchmark datasets."""
+    args = parse_args()
+    summary_path = INTERIM_ROOT / "dataset_build_summary.json"
+    if summary_path.exists() and not args.force:
+        logger.info("Dataset outputs already exist; use --force to rebuild")
+        return
+    logger.info("=" * 80)
+    logger.info("Building SFT, DPO, GRPO, and benchmark datasets")
+    logger.info("=" * 80)
+    qrecc_train = read_jsonl(INTERIM_ROOT / "qrecc_train.jsonl")
+    qrecc_test = read_jsonl(INTERIM_ROOT / "qrecc_test.jsonl")
+    qrecc_test_keys = {qrecc_content_key(record) for record in qrecc_test}
+    qrecc_train_before_filter = len(qrecc_train)
+    qrecc_train = [
+        record
+        for record in qrecc_train
+        if qrecc_content_key(record) not in qrecc_test_keys
+    ]
+    conditional_train = read_jsonl(INTERIM_ROOT / "conditionalqa_train.jsonl")
+    musique_train = read_jsonl(INTERIM_ROOT / "musique_train.jsonl")
+
+    sft_records, policy_plans = build_sft_records(qrecc_train, conditional_train)
+    dpo_records = build_dpo_records(qrecc_train, conditional_train, policy_plans)
+    grpo_records = build_grpo_records(musique_train)
+
+    write_jsonl(PROCESSED_ROOT / "train" / "sft_train.jsonl", sft_records)
+    write_jsonl(PROCESSED_ROOT / "train" / "dpo_train.jsonl", dpo_records)
+    write_jsonl(PROCESSED_ROOT / "train" / "grpo_train.jsonl", grpo_records)
+    eval_counts = export_evaluation_sets()
+    write_dataset_info()
+
+    summary = {
+        "sft_count": len(sft_records),
+        "qrecc_train_exact_benchmark_duplicates_removed": (
+            qrecc_train_before_filter - len(qrecc_train)
+        ),
+        "sft_source_counts": dict(Counter(record["sample_type"] for record in sft_records)),
+        "dpo_count": len(dpo_records),
+        "dpo_source_counts": dict(Counter(record["source_dataset"] for record in dpo_records)),
+        "dpo_error_counts": dict(Counter(record["error_type"] for record in dpo_records)),
+        "grpo_count": len(grpo_records),
+        "grpo_hop_counts": dict(Counter(str(record["hop_count"]) for record in grpo_records)),
+        "eval_counts": eval_counts
+    }
+    write_json(summary_path, summary)
+    logger.info("Built SFT=%d, DPO=%d, GRPO=%d", len(sft_records), len(dpo_records), len(grpo_records))
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level = logging.INFO,
+        format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers = [logging.StreamHandler()]
+    )
+    main()
